@@ -69,41 +69,68 @@ log "Resolving latest Canonical Ubuntu 24.04 (non-Minimal) ARM image ..."
 #      a) Canonical-Ubuntu-24.04 + aarch64 + not Minimal (the exact ARM build)
 #      b) Canonical-Ubuntu-24.04 + not Minimal (any arch, if aarch64 naming changes)
 #      c) Ubuntu 24.04 + aarch64 + not Minimal (if the Canonical prefix changes)
-# NOTE on the 2026-11-01 second failure: the previous version used
-# --all here and returned nothing at all. --all may not be valid for
-# this list command in the installed OCI CLI version, and the old code
-# hid the real oci error (stderr went only to retry.log, and the
-# workflow tail showed only the die() line). This version therefore:
-#   1. Runs WITHOUT --all (the original form, which at least returned
-#      JSON on the first run).
-#   2. Captures the oci exit code and stderr separately, and logs the
-#      stderr lines visibly (with any OCID-looking strings redacted,
-#      since Actions logs for a public repo are public).
-#   3. If the broad list still returns nothing, retries the original
-#      version+shape filtered list before giving up, so one filter
-#      failure alone cannot kill the run.
+# NOTE on the 2026-11-01 failures, in order:
+#   1. First run: full list with version+shape filters returned JSON
+#      but the jq name filter found no match.
+#   2. Second run: full list with --all returned nothing.
+#   3. Third run (log 17:50 UTC): full list WITHOUT --all, broad AND
+#      version+shape fallback, BOTH returned empty stdout with exit 0
+#      and no stderr. That is the key clue: VCN / subnet / AD lists
+#      in this same script DO succeed, and they all use
+#      --query ... --raw-output. The full-JSON image list does not.
+#      So this version tries the --query form FIRST (the proven
+#      pattern in this environment), asking OCI for only id,
+#      display-name and time-created per image, then normalises that
+#      array back to the {data: [...]} shape the picker expects.
+#      It logs every attempt (exit code, output length, count) so the
+#      next log will show which form actually works, instead of
+#      dying on the first empty output. OCID-looking strings are
+#      redacted in logged stderr, since Actions logs for a public
+#      repo are public.
 IMAGE_ERR_FILE="$(mktemp)"
-IMAGE_JSON="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu 2>"$IMAGE_ERR_FILE")"
-IMAGE_STATUS=$?
-if [ "$IMAGE_STATUS" -ne 0 ] || [ -z "$IMAGE_JSON" ]; then
-  log "oci compute image list (broad) failed or returned nothing, exit $IMAGE_STATUS"
+IMAGE_JSON=""
+try_list() {
+  # $1 = label; the caller sets TRY_ARGS as an array before calling.
+  # IMPORTANT: diagnostic lines inside this function must NOT go to
+  # stdout, because the caller captures this function's stdout as the
+  # oci JSON output. They go to retry.log AND to stderr (which GitHub
+  # Actions still shows in the step log), via tee >&2.
+  local label="$1"
+  local out status len ts
+  out="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" "${TRY_ARGS[@]}" 2>"$IMAGE_ERR_FILE")"
+  status=$?
+  len=${#out}
+  ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo "[$ts] image list try [$label]: exit $status, stdout length $len" | tee -a "$LOG_FILE" >&2
   if [ -s "$IMAGE_ERR_FILE" ]; then
-    sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do log "  oci error: $line"; done
-  else
-    log "  oci error: (no stderr captured)"
+    sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do echo "[$ts]   oci error: $line" | tee -a "$LOG_FILE" >&2; done
   fi
-  log "Trying fallback image list (version 24.04 + shape A1.Flex)..."
-  IMAGE_JSON="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu --operating-system-version 24.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC 2>"$IMAGE_ERR_FILE")"
-  IMAGE_STATUS=$?
-  if [ "$IMAGE_STATUS" -ne 0 ] || [ -z "$IMAGE_JSON" ]; then
-    log "Fallback image list also failed or returned nothing, exit $IMAGE_STATUS"
-    if [ -s "$IMAGE_ERR_FILE" ]; then
-      sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do log "  oci error: $line"; done
-    fi
-    die "oci compute image list returned nothing — see the oci error lines above for the real cause (auth / config / region / CLI arguments)"
+  printf '%s' "$out"
+}
+# Try 1: query-filtered list (proven pattern) — returns a JSON array
+# of {id, name, time}, which we normalise to {data: [...]}.
+TRY_ARGS=(--operating-system Ubuntu --query 'data[].{id: id, name: "display-name", time: "time-created"}')
+QUERY_OUT="$(try_list "query id/name/time")"
+if [ -n "$QUERY_OUT" ]; then
+  IMAGE_JSON="$(printf '%s' "$QUERY_OUT" | jq '{data: map({id: .id, "display-name": .name, "time-created": .time})}' 2>/dev/null || echo "")"
+  if [ -n "$IMAGE_JSON" ]; then
+    log "image list try [query id/name/time]: normalised data length $(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo '?')"
   fi
 fi
+# Try 2: full list, broad (no version/shape filter).
+if [ -z "$IMAGE_JSON" ]; then
+  TRY_ARGS=(--operating-system Ubuntu)
+  IMAGE_JSON="$(try_list "full broad")"
+fi
+# Try 3: full list, version+shape filtered (original form).
+if [ -z "$IMAGE_JSON" ]; then
+  TRY_ARGS=(--operating-system Ubuntu --operating-system-version 24.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC)
+  IMAGE_JSON="$(try_list "full version+shape")"
+fi
 rm -f "$IMAGE_ERR_FILE"
+if [ -z "$IMAGE_JSON" ]; then
+  die "oci compute image list returned nothing in all three forms (query, full broad, full version+shape) — all exited 0 with no stderr in the previous run, so the list API itself is returning empty stdout in this runner; check the try logs above and, if they are all empty, use a pinned image OCID from Console > Compute > Images instead"
+fi
 IMAGE_COUNT="$(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo "?")"
 log "Ubuntu images returned by OCI: $IMAGE_COUNT"
 printf '%s' "$IMAGE_JSON" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[0:20][] | "\(.["time-created"]) \(.["display-name"])"' 2>/dev/null | while IFS= read -r line; do log "  image: $line"; done
