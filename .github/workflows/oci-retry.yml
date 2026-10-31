@@ -62,7 +62,6 @@ jobs:
       - name: Run retry loop (up to 330 minutes)
         env:
           COMPARTMENT_OCID: ${{ secrets.OCI_TENANCY_OCID }}
-          SSH_PUBLIC_KEY_FILE: ${{ env.HOME }}/.ssh/oracle_instance.pub
           REGION: ${{ secrets.OCI_REGION }}
           SLEEP_SECONDS: "60"
           MAX_RUNTIME_MINUTES: "330"
@@ -70,6 +69,19 @@ jobs:
           RESULT_FILE: ./retry_result
         run: |
           set +e
+          # NOTE: Do NOT use the env-context HOME here — GitHub's env
+          # context does not contain the runner's HOME, so it expands
+          # to empty and the script looked for /.ssh/oracle_instance.pub
+          # (the 2026-11-01 first-run failure). Use the shell's $HOME instead,
+          # which is /home/runner on ubuntu-latest and matches the
+          # Configure step that wrote the file.
+          export SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle_instance.pub"
+          ls -l "$SSH_PUBLIC_KEY_FILE"
+          if [ ! -s "$SSH_PUBLIC_KEY_FILE" ]; then
+            echo "ERROR: OCI_SSH_PUBLIC_KEY secret is empty or missing — the file exists but is 0 bytes. Check the Repository secret, then re-run."
+            echo "FAILED" > ./retry_result
+            exit 1
+          fi
           bash scripts/retry.sh
           echo "retry_exit=$?" >> "$GITHUB_ENV"
           echo "--- retry_result ---"
