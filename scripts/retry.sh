@@ -53,10 +53,51 @@ AD_NAME="$(oci iam availability-domain list --compartment-id "$COMPARTMENT_OCID"
 log "Availability domain: $AD_NAME"
 
 log "Resolving latest Canonical Ubuntu 24.04 (non-Minimal) ARM image ..."
-IMAGE_JSON="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu --operating-system-version 24.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC 2>>"$LOG_FILE")"
-IMAGE_ID="$(printf '%s' "$IMAGE_JSON" | jq -r '.data[] | select(.["display-name"] | test("Canonical-Ubuntu-24.04") and (test("Minimal") | not)) | .id' | head -n 1)"
-IMAGE_NAME="$(printf '%s' "$IMAGE_JSON" | jq -r '.data[] | select(.["display-name"] | test("Canonical-Ubuntu-24.04") and (test("Minimal") | not)) | .["display-name"]' | head -n 1)"
-[ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "null" ] || die "Could not find a Canonical Ubuntu 24.04 (non-Minimal) ARM image"
+# 2026-11-01 first Actions run failed here, even though the same image
+# (Canonical Ubuntu 24.04, build 2026.10.27-0, ARM) was verified in the
+# browser Create form. The old query was too narrow: it filtered by
+# --operating-system-version 24.04 AND --shape VM.Standard.A1.Flex AND
+# sort, and any one of those filters returning nothing (or a paginated
+# first page without the ARM build) made the whole resolution fail with
+# no diagnostic output. The new logic is deliberately broad, then
+# filters in jq, with fallbacks and diagnostic logging (display names
+# are public, not secrets, so listing them in the log is safe):
+#   1. List ALL Ubuntu images in the tenancy ( --all, no version/shape
+#      filter, so pagination or a filter mismatch cannot hide the image).
+#   2. Log how many were returned and the newest 20 display names.
+#   3. Pick, newest first by time-created:
+#      a) Canonical-Ubuntu-24.04 + aarch64 + not Minimal (the exact ARM build)
+#      b) Canonical-Ubuntu-24.04 + not Minimal (any arch, if aarch64 naming changes)
+#      c) Ubuntu 24.04 + aarch64 + not Minimal (if the Canonical prefix changes)
+IMAGE_JSON="$(oci compute image list --all --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu 2>>"$LOG_FILE" || true)"
+if [ -z "$IMAGE_JSON" ]; then
+  die "oci compute image list returned nothing (check OCI config / API key / tenancy in the log above)"
+fi
+IMAGE_COUNT="$(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo "?")"
+log "Ubuntu images returned by OCI: $IMAGE_COUNT"
+printf '%s' "$IMAGE_JSON" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[0:20][] | "\(.["time-created"]) \(.["display-name"])"' 2>/dev/null | while IFS= read -r line; do log "  image: $line"; done
+pick_image() {
+  # $1 = jq filter expression; prints "id<TAB>display-name" for the newest match, or nothing.
+  printf '%s' "$IMAGE_JSON" | jq -r "
+    .data
+    | sort_by(.\"time-created\") | reverse
+    | map(select($1))
+    | .[0] // empty
+    | \"\(.id)\t\(.\"display-name\")\"
+  " 2>/dev/null
+}
+IMAGE_PICK="$(pick_image '.["display-name"] | test("Canonical-Ubuntu-24\\.04") and test("aarch64") and (test("Minimal") | not)')"
+if [ -z "$IMAGE_PICK" ]; then
+  log "Primary image filter (Canonical + 24.04 + aarch64 + not Minimal) found nothing; trying fallback (Canonical + 24.04 + not Minimal)..."
+  IMAGE_PICK="$(pick_image '.["display-name"] | test("Canonical-Ubuntu-24\\.04") and (test("Minimal") | not)')"
+fi
+if [ -z "$IMAGE_PICK" ]; then
+  log "Fallback 1 found nothing; trying fallback 2 (Ubuntu 24.04 + aarch64 + not Minimal)..."
+  IMAGE_PICK="$(pick_image '.["display-name"] | test("24\\.04") and test("aarch64") and (test("Minimal") | not)')"
+fi
+IMAGE_ID="$(printf '%s' "$IMAGE_PICK" | cut -f1)"
+IMAGE_NAME="$(printf '%s' "$IMAGE_PICK" | cut -f2-)"
+[ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "null" ] || die "Could not find a Canonical Ubuntu 24.04 (non-Minimal) ARM image — see the image list logged above for what OCI actually returned in this region"
 log "Image resolved: $IMAGE_NAME"
 
 log "Checking whether instance $INSTANCE_NAME already exists ..."
