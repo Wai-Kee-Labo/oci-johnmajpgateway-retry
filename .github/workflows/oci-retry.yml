@@ -1,0 +1,102 @@
+name: OCI Always Free retry — JohnMaJPGateway
+
+# Runs every 6 hours (UTC). Each run loops for up to 330 minutes, then
+# exits cleanly (TIMEOUT) so the next scheduled run resumes. The gap
+# between runs is about 30 minutes, plus GitHub's schedule delay.
+# Concurrency is set so overlapping runs queue instead of racing to
+# create the same instance.
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oci-johnmajpgateway-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI and jq
+        run: |
+          python3 -m pip install --user --quiet oci-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          command -v jq || sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          oci --version
+          jq --version
+
+      - name: Configure OCI from secrets (never printed)
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          set -e
+          mkdir -p "$HOME/.oci" "$HOME/.ssh"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER_OCID"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY_OCID"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/oci_api_key.pem"
+          } > "$HOME/.oci/config"
+          chmod 600 "$HOME/.oci/config"
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$HOME/.ssh/oracle_instance.pub"
+          chmod 644 "$HOME/.ssh/oracle_instance.pub"
+          echo "OCI config written (values not printed)."
+
+      - name: Run retry loop (up to 330 minutes)
+        env:
+          COMPARTMENT_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          SSH_PUBLIC_KEY_FILE: ${{ env.HOME }}/.ssh/oracle_instance.pub
+          REGION: ${{ secrets.OCI_REGION }}
+          SLEEP_SECONDS: "60"
+          MAX_RUNTIME_MINUTES: "330"
+          LOG_FILE: ./retry.log
+          RESULT_FILE: ./retry_result
+        run: |
+          set +e
+          bash scripts/retry.sh
+          echo "retry_exit=$?" >> "$GITHUB_ENV"
+          echo "--- retry_result ---"
+          cat ./retry_result 2>/dev/null || echo "no result file"
+          echo "--- last log lines ---"
+          tail -n 30 ./retry.log 2>/dev/null || true
+          # Do not fail the workflow on TIMEOUT or ALREADY_EXISTS;
+          # only a real FAILED result should mark the run failed.
+          RESULT="$(cat ./retry_result 2>/dev/null || echo FAILED)"
+          if [ "$RESULT" = "FAILED" ]; then
+            exit 1
+          fi
+          exit 0
+
+      - name: Show instance details on success
+        if: success()
+        run: |
+          RESULT="$(cat ./retry_result 2>/dev/null || echo '')"
+          if [ "$RESULT" != "SUCCESS" ] && [ "$RESULT" != "ALREADY_EXISTS" ]; then
+            echo "No new instance to report (result: $RESULT)."
+            exit 0
+          fi
+          INSTANCE_ID="$(oci compute instance list --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" --display-name JohnMaJPGateway --query 'data[?lifecycle-state!=`TERMINATED`].id' --raw-output)"
+          echo "Instance: JohnMaJPGateway"
+          oci compute instance list --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" --display-name JohnMaJPGateway --query 'data[?lifecycle-state!=`TERMINATED`].[display-name,lifecycle-state]' --output table || true
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ]; then
+            echo "Public IP:"
+            oci compute instance list-vnics --instance-id "$INSTANCE_ID" --query 'data[0]."public-ip"' --raw-output || true
+          fi
+          echo "Reminder: public ingress is currently blocked on the Default Security List. Add an SSH ingress rule back before trying to SSH in."
