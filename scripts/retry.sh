@@ -69,10 +69,41 @@ log "Resolving latest Canonical Ubuntu 24.04 (non-Minimal) ARM image ..."
 #      a) Canonical-Ubuntu-24.04 + aarch64 + not Minimal (the exact ARM build)
 #      b) Canonical-Ubuntu-24.04 + not Minimal (any arch, if aarch64 naming changes)
 #      c) Ubuntu 24.04 + aarch64 + not Minimal (if the Canonical prefix changes)
-IMAGE_JSON="$(oci compute image list --all --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu 2>>"$LOG_FILE" || true)"
-if [ -z "$IMAGE_JSON" ]; then
-  die "oci compute image list returned nothing (check OCI config / API key / tenancy in the log above)"
+# NOTE on the 2026-11-01 second failure: the previous version used
+# --all here and returned nothing at all. --all may not be valid for
+# this list command in the installed OCI CLI version, and the old code
+# hid the real oci error (stderr went only to retry.log, and the
+# workflow tail showed only the die() line). This version therefore:
+#   1. Runs WITHOUT --all (the original form, which at least returned
+#      JSON on the first run).
+#   2. Captures the oci exit code and stderr separately, and logs the
+#      stderr lines visibly (with any OCID-looking strings redacted,
+#      since Actions logs for a public repo are public).
+#   3. If the broad list still returns nothing, retries the original
+#      version+shape filtered list before giving up, so one filter
+#      failure alone cannot kill the run.
+IMAGE_ERR_FILE="$(mktemp)"
+IMAGE_JSON="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu 2>"$IMAGE_ERR_FILE")"
+IMAGE_STATUS=$?
+if [ "$IMAGE_STATUS" -ne 0 ] || [ -z "$IMAGE_JSON" ]; then
+  log "oci compute image list (broad) failed or returned nothing, exit $IMAGE_STATUS"
+  if [ -s "$IMAGE_ERR_FILE" ]; then
+    sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do log "  oci error: $line"; done
+  else
+    log "  oci error: (no stderr captured)"
+  fi
+  log "Trying fallback image list (version 24.04 + shape A1.Flex)..."
+  IMAGE_JSON="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" --operating-system Ubuntu --operating-system-version 24.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC 2>"$IMAGE_ERR_FILE")"
+  IMAGE_STATUS=$?
+  if [ "$IMAGE_STATUS" -ne 0 ] || [ -z "$IMAGE_JSON" ]; then
+    log "Fallback image list also failed or returned nothing, exit $IMAGE_STATUS"
+    if [ -s "$IMAGE_ERR_FILE" ]; then
+      sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do log "  oci error: $line"; done
+    fi
+    die "oci compute image list returned nothing — see the oci error lines above for the real cause (auth / config / region / CLI arguments)"
+  fi
 fi
+rm -f "$IMAGE_ERR_FILE"
 IMAGE_COUNT="$(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo "?")"
 log "Ubuntu images returned by OCI: $IMAGE_COUNT"
 printf '%s' "$IMAGE_JSON" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[0:20][] | "\(.["time-created"]) \(.["display-name"])"' 2>/dev/null | while IFS= read -r line; do log "  image: $line"; done
