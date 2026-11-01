@@ -52,111 +52,53 @@ AD_NAME="$(oci iam availability-domain list --compartment-id "$COMPARTMENT_OCID"
 [ -n "$AD_NAME" ] && [ "$AD_NAME" != "null" ] || die "Could not list availability domains"
 log "Availability domain: $AD_NAME"
 
-log "Resolving latest Canonical Ubuntu 24.04 (non-Minimal) ARM image ..."
-# 2026-11-01 first Actions run failed here, even though the same image
-# (Canonical Ubuntu 24.04, build 2026.10.27-0, ARM) was verified in the
-# browser Create form. The old query was too narrow: it filtered by
-# --operating-system-version 24.04 AND --shape VM.Standard.A1.Flex AND
-# sort, and any one of those filters returning nothing (or a paginated
-# first page without the ARM build) made the whole resolution fail with
-# no diagnostic output. The new logic is deliberately broad, then
-# filters in jq, with fallbacks and diagnostic logging (display names
-# are public, not secrets, so listing them in the log is safe):
-#   1. List ALL Ubuntu images in the tenancy ( --all, no version/shape
-#      filter, so pagination or a filter mismatch cannot hide the image).
-#   2. Log how many were returned and the newest 20 display names.
-#   3. Pick, newest first by time-created:
-#      a) Canonical-Ubuntu-24.04 + aarch64 + not Minimal (the exact ARM build)
-#      b) Canonical-Ubuntu-24.04 + not Minimal (any arch, if aarch64 naming changes)
-#      c) Ubuntu 24.04 + aarch64 + not Minimal (if the Canonical prefix changes)
-# NOTE on the 2026-11-01 failures, in order:
-#   1. First run: full list with version+shape filters returned JSON
-#      but the jq name filter found no match.
-#   2. Second run: full list with --all returned nothing.
-#   3. Third run (log 17:50 UTC): full list WITHOUT --all, broad AND
-#      version+shape fallback, BOTH returned empty stdout with exit 0
-#      and no stderr. That is the key clue: VCN / subnet / AD lists
-#      in this same script DO succeed, and they all use
-#      --query ... --raw-output. The full-JSON image list does not.
-#      So this version tries the --query form FIRST (the proven
-#      pattern in this environment), asking OCI for only id,
-#      display-name and time-created per image, then normalises that
-#      array back to the {data: [...]} shape the picker expects.
-#      It logs every attempt (exit code, output length, count) so the
-#      next log will show which form actually works, instead of
-#      dying on the first empty output. OCID-looking strings are
-#      redacted in logged stderr, since Actions logs for a public
-#      repo are public.
+log "Resolving pinned Ubuntu 24.04 ARM image (no image list) ..."
+# 2026-11-01 pinned-image change: oci compute image list returned
+# empty stdout (exit 0, no stderr) in all three forms tried in the
+# Actions runner (query, full broad, full version+shape), while
+# VCN / subnet / AD lists in the same script succeed. Further list
+# tweaking is therefore not expected to help. Instead, use the exact
+# image OCID the user copied from Console > Compute > Images on
+# 2026-11-01. This is a public Oracle platform image OCID, not a
+# secret, so logging its display name (not the OCID itself, to keep
+# Actions logs clean) is safe. The script verifies the image with
+# oci compute image get BEFORE launching, and refuses to launch if
+# the name is not Ubuntu 24.04 ARM, if it is Minimal, or if it is
+# not AVAILABLE — so a wrong OCID cannot silently launch the wrong OS.
+PINNED_IMAGE_OCID="${IMAGE_OCID:-ocid1.image.oc1.ap-osaka-1.aaaaaaaafjymvqo2bqj5uur45dfvhch6sp72yedb7xfaenkbvufx5zisnmya}"
 IMAGE_ERR_FILE="$(mktemp)"
-IMAGE_JSON=""
-try_list() {
-  # $1 = label; the caller sets TRY_ARGS as an array before calling.
-  # IMPORTANT: diagnostic lines inside this function must NOT go to
-  # stdout, because the caller captures this function's stdout as the
-  # oci JSON output. They go to retry.log AND to stderr (which GitHub
-  # Actions still shows in the step log), via tee >&2.
-  local label="$1"
-  local out status len ts
-  out="$(oci compute image list --compartment-id "$COMPARTMENT_OCID" "${TRY_ARGS[@]}" 2>"$IMAGE_ERR_FILE")"
-  status=$?
-  len=${#out}
-  ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  echo "[$ts] image list try [$label]: exit $status, stdout length $len" | tee -a "$LOG_FILE" >&2
+IMAGE_GET_JSON="$(oci compute image get --image-id "$PINNED_IMAGE_OCID" 2>"$IMAGE_ERR_FILE")"
+IMAGE_GET_STATUS=$?
+if [ "$IMAGE_GET_STATUS" -ne 0 ] || [ -z "$IMAGE_GET_JSON" ]; then
+  log "oci compute image get failed, exit $IMAGE_GET_STATUS"
   if [ -s "$IMAGE_ERR_FILE" ]; then
-    sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do echo "[$ts]   oci error: $line" | tee -a "$LOG_FILE" >&2; done
+    sed -E 's/ocid1\.[a-zA-Z0-9._-]+/<OCID>/g' "$IMAGE_ERR_FILE" | while IFS= read -r line; do log "  oci error: $line"; done
   fi
-  printf '%s' "$out"
-}
-# Try 1: query-filtered list (proven pattern) — returns a JSON array
-# of {id, name, time}, which we normalise to {data: [...]}.
-TRY_ARGS=(--operating-system Ubuntu --query 'data[].{id: id, name: "display-name", time: "time-created"}')
-QUERY_OUT="$(try_list "query id/name/time")"
-if [ -n "$QUERY_OUT" ]; then
-  IMAGE_JSON="$(printf '%s' "$QUERY_OUT" | jq '{data: map({id: .id, "display-name": .name, "time-created": .time})}' 2>/dev/null || echo "")"
-  if [ -n "$IMAGE_JSON" ]; then
-    log "image list try [query id/name/time]: normalised data length $(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo '?')"
-  fi
-fi
-# Try 2: full list, broad (no version/shape filter).
-if [ -z "$IMAGE_JSON" ]; then
-  TRY_ARGS=(--operating-system Ubuntu)
-  IMAGE_JSON="$(try_list "full broad")"
-fi
-# Try 3: full list, version+shape filtered (original form).
-if [ -z "$IMAGE_JSON" ]; then
-  TRY_ARGS=(--operating-system Ubuntu --operating-system-version 24.04 --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC)
-  IMAGE_JSON="$(try_list "full version+shape")"
+  rm -f "$IMAGE_ERR_FILE"
+  die "Could not verify the pinned image — check that the OCID copied from Console is correct and that the API key can read images in ap-osaka-1"
 fi
 rm -f "$IMAGE_ERR_FILE"
-if [ -z "$IMAGE_JSON" ]; then
-  die "oci compute image list returned nothing in all three forms (query, full broad, full version+shape) — all exited 0 with no stderr in the previous run, so the list API itself is returning empty stdout in this runner; check the try logs above and, if they are all empty, use a pinned image OCID from Console > Compute > Images instead"
+IMAGE_NAME="$(printf '%s' "$IMAGE_GET_JSON" | jq -r '.data."display-name" // empty' 2>/dev/null)"
+IMAGE_OS="$(printf '%s' "$IMAGE_GET_JSON" | jq -r '.data."operating-system" // empty' 2>/dev/null)"
+IMAGE_OS_VERSION="$(printf '%s' "$IMAGE_GET_JSON" | jq -r '.data."operating-system-version" // empty' 2>/dev/null)"
+IMAGE_STATE="$(printf '%s' "$IMAGE_GET_JSON" | jq -r '.data."lifecycle-state" // empty' 2>/dev/null)"
+log "Pinned image verified from OCI: name=$IMAGE_NAME, OS=$IMAGE_OS $IMAGE_OS_VERSION, state=$IMAGE_STATE"
+case "$IMAGE_NAME" in
+  *aarch64*) ;;
+  *) die "Pinned image is not ARM (display name does not contain aarch64: $IMAGE_NAME) — refusing to launch, check the OCID copied from Console" ;;
+esac
+case "$IMAGE_NAME" in
+  *Minimal*) die "Pinned image is a Minimal variant ($IMAGE_NAME) — refusing to launch, the spec requires the full (non-Minimal) Ubuntu 24.04 ARM image" ;;
+esac
+case "$IMAGE_OS $IMAGE_OS_VERSION" in
+  "Ubuntu 24.04") ;;
+  *) die "Pinned image is not Ubuntu 24.04 (got OS=$IMAGE_OS version=$IMAGE_OS_VERSION, name=$IMAGE_NAME) — refusing to launch" ;;
+esac
+if [ "$IMAGE_STATE" != "AVAILABLE" ]; then
+  die "Pinned image is not AVAILABLE (state=$IMAGE_STATE, name=$IMAGE_NAME) — refusing to launch"
 fi
-IMAGE_COUNT="$(printf '%s' "$IMAGE_JSON" | jq -r '.data | length' 2>/dev/null || echo "?")"
-log "Ubuntu images returned by OCI: $IMAGE_COUNT"
-printf '%s' "$IMAGE_JSON" | jq -r '.data | sort_by(.["time-created"]) | reverse | .[0:20][] | "\(.["time-created"]) \(.["display-name"])"' 2>/dev/null | while IFS= read -r line; do log "  image: $line"; done
-pick_image() {
-  # $1 = jq filter expression; prints "id<TAB>display-name" for the newest match, or nothing.
-  printf '%s' "$IMAGE_JSON" | jq -r "
-    .data
-    | sort_by(.\"time-created\") | reverse
-    | map(select($1))
-    | .[0] // empty
-    | \"\(.id)\t\(.\"display-name\")\"
-  " 2>/dev/null
-}
-IMAGE_PICK="$(pick_image '.["display-name"] | test("Canonical-Ubuntu-24\\.04") and test("aarch64") and (test("Minimal") | not)')"
-if [ -z "$IMAGE_PICK" ]; then
-  log "Primary image filter (Canonical + 24.04 + aarch64 + not Minimal) found nothing; trying fallback (Canonical + 24.04 + not Minimal)..."
-  IMAGE_PICK="$(pick_image '.["display-name"] | test("Canonical-Ubuntu-24\\.04") and (test("Minimal") | not)')"
-fi
-if [ -z "$IMAGE_PICK" ]; then
-  log "Fallback 1 found nothing; trying fallback 2 (Ubuntu 24.04 + aarch64 + not Minimal)..."
-  IMAGE_PICK="$(pick_image '.["display-name"] | test("24\\.04") and test("aarch64") and (test("Minimal") | not)')"
-fi
-IMAGE_ID="$(printf '%s' "$IMAGE_PICK" | cut -f1)"
-IMAGE_NAME="$(printf '%s' "$IMAGE_PICK" | cut -f2-)"
-[ -n "$IMAGE_ID" ] && [ "$IMAGE_ID" != "null" ] || die "Could not find a Canonical Ubuntu 24.04 (non-Minimal) ARM image — see the image list logged above for what OCI actually returned in this region"
-log "Image resolved: $IMAGE_NAME"
+IMAGE_ID="$PINNED_IMAGE_OCID"
+log "Image resolved (pinned): $IMAGE_NAME"
 
 log "Checking whether instance $INSTANCE_NAME already exists ..."
 EXISTING="$(oci compute instance list --compartment-id "$COMPARTMENT_OCID" --display-name "$INSTANCE_NAME" --query 'data[?lifecycle-state!=`TERMINATED`].id' --raw-output 2>>"$LOG_FILE" || true)"
