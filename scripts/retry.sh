@@ -90,8 +90,12 @@ esac
 case "$IMAGE_NAME" in
   *Minimal*) die "Pinned image is a Minimal variant ($IMAGE_NAME) — refusing to launch, the spec requires the full (non-Minimal) Ubuntu 24.04 ARM image" ;;
 esac
+# OCI quirk, found 2026-11-01: the image's operating-system field
+# is "Canonical Ubuntu", not "Ubuntu" — the --operating-system
+# Ubuntu list filter and the stored field value are different.
+# Accept both spellings, still requiring version 24.04 exactly.
 case "$IMAGE_OS $IMAGE_OS_VERSION" in
-  "Ubuntu 24.04") ;;
+  "Ubuntu 24.04"|"Canonical Ubuntu 24.04") ;;
   *) die "Pinned image is not Ubuntu 24.04 (got OS=$IMAGE_OS version=$IMAGE_OS_VERSION, name=$IMAGE_NAME) — refusing to launch" ;;
 esac
 if [ "$IMAGE_STATE" != "AVAILABLE" ]; then
