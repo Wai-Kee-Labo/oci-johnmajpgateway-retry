@@ -16,7 +16,13 @@ REGION="${REGION:-ap-osaka-1}"
 INSTANCE_NAME="${INSTANCE_NAME:-JohnMaJPGateway}"
 VCN_NAME="${VCN_NAME:-JohnMaJPGatewayVCN}"
 PUBLIC_SUBNET_NAME="${PUBLIC_SUBNET_NAME:-public subnet-JohnMaJPGatewayVCN}"
-SLEEP_SECONDS="${SLEEP_SECONDS:-60}"
+# 2026-11-01 community 429 floor: polling faster than ~60s earns
+# 429 TooManyRequests, one guide uses 85s as its floor. Use 90s
+# (above both, with margin) and enforce it as a floor even if the
+# workflow still passes a lower value, so a stale workflow env
+# cannot silently reintroduce the 429 risk.
+SLEEP_SECONDS="${SLEEP_SECONDS:-90}"
+if [ "$SLEEP_SECONDS" -lt 90 ]; then SLEEP_SECONDS=90; fi
 MAX_RUNTIME_MINUTES="${MAX_RUNTIME_MINUTES:-330}"
 LOG_FILE="${LOG_FILE:-./retry.log}"
 RESULT_FILE="${RESULT_FILE:-./retry_result}"
